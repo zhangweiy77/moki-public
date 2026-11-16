@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Muse CN 电脑底座 · 一键安装（v0.2.0）
+# Muse CN 电脑底座 · 一键安装（v0.3.0）
 # 在 Ubuntu / Debian 电脑上粘贴运行：
 #   curl -fsSL https://raw.githubusercontent.com/zhangweiy77/muse-cn-releases/main/install.sh | bash
 # 做四件事：把底座程序放进 ~/.musecn、设成开机自启的常驻服务、启动它、打印 6 位配对码。
@@ -27,13 +27,16 @@ cat > "$DIR/musecn_pc.py" <<'MUSECN_PC_PY_EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Muse CN 电脑底座（musecn-pc）v0.2.0
+Muse CN 电脑底座（musecn-pc）v0.3.0
 
 纯 Python 标准库、零依赖的小服务，形态学 mac-hand：
-- HTTP JSON 接口（状态 / 执行命令 / 读文件），令牌鉴权，无令牌一律拒绝
+- HTTP JSON 接口（状态 / 执行命令 / 读文件 / 长期记忆），令牌鉴权，无令牌一律拒绝
 - UDP 广播发现：手机在同一局域网里能找到这台电脑
 - 配对：服务启动时生成 6 位配对码（终端大字打印 + 写 ~/.musecn/pairing.txt），
   手机输码换长期令牌，配对只做一次，令牌落盘、重启不丢
+- 长期记忆（v0.3 新增）：~/.musecn/memory/ 下两个文件——SOUL.md 是助手的
+  「性格说明书」（用户可改），MEMORY.md 是蒸馏过的长期记忆条目（每行一条）。
+  与聊天记录分工：记录是流水、留手机本地；这里存的是提炼后要长期用的。
 
 状态目录：~/.musecn/（state.json 存令牌与配对状态，权限 600）
 监听：0.0.0.0:18790（HTTP），UDP 18791（发现）。可用环境变量 MUSECN_PORT 改 HTTP 端口。
@@ -51,7 +54,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_PORT = int(os.environ.get("MUSECN_PORT", "18790"))
 DISCOVERY_PORT = 18791
 DISCOVERY_MAGIC = "MUSECN_DISCOVER_V1"
@@ -60,6 +63,9 @@ HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(HOME, ".musecn")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 PAIR_FILE = os.path.join(STATE_DIR, "pairing.txt")
+MEMORY_DIR = os.path.join(STATE_DIR, "memory")
+SOUL_FILE = os.path.join(MEMORY_DIR, "SOUL.md")
+MEMORY_FILE = os.path.join(MEMORY_DIR, "MEMORY.md")
 
 MAX_OUTPUT_CHARS = 8000       # 命令输出截断上限（单流）
 MAX_READ_CHARS = 16000        # 读文件截断上限
@@ -165,6 +171,108 @@ class State:
 
 
 STATE = None  # 在 main 里初始化
+
+
+# ---------------- 长期记忆（SOUL + MEMORY） ----------------
+
+DEFAULT_SOUL = """【先说清这一页】这是住在这台电脑里的助手 Muse CN 的「性格说明书」：它怎么说话、怎么做事，都照这里写的来。你把这里改了，它下次跟你说话就会照新的来。
+
+# 我是谁
+
+我是 Muse CN，住在你这台电脑里的助手。你在手机上给我下令，我在这台电脑上帮你干活，办完把结果带回来给你。
+
+# 我怎么说话
+
+- 说人话，说大白话，不绕弯子，不用你听不懂的词。
+- 先说结果，再说细节；能一句话说清的，不说三句。
+- 不说客套话，不拍马屁，也不用吓唬人的口气。
+- 不确定的事就说不确定，不编。
+
+# 我怎么做事
+
+- 你交代的事，我先想清楚最短的路，再动手。
+- 拿不准、怕弄坏的事，先问你再动。
+- 办完事把结果说清楚：做了什么、成了没有、有什么要注意的。
+- 值得长期记住的事，我会记到长期记忆里，下次不用你重复说。
+
+（这一页是写给我的「性格说明书」，就放在你电脑里，你随时可以改——改成什么样，我就照着什么样来。）
+"""
+
+# MEMORY 文件的第一行固定是这句说明（以 # 开头，App 与系统提示都会跳过它、不当条目）
+MEMORY_HEADER = "# 这是我的长期记忆：我记住的、以后还用得上的事都在这里，一行一条，前面带日期。你可以改、可以删——删掉哪条，我就忘掉哪条。"
+
+MAX_MEMORY_CHARS = 200000  # SOUL / MEMORY 单个文件的写入上限（字数）
+
+_memory_lock = threading.Lock()
+
+
+def _atomic_write(path, text):
+    """原子写：先把旧内容留一份 .bak，再写临时文件、改名替换，写一半断电也不坏。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        try:
+            shutil.copyfile(path, path + ".bak")
+        except OSError:
+            pass
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def ensure_memory():
+    """首次启动时把记忆目录与两个文件建好；已有的内容一个字都不动。"""
+    with _memory_lock:
+        os.makedirs(MEMORY_DIR, exist_ok=True)
+        if not os.path.exists(SOUL_FILE):
+            _atomic_write(SOUL_FILE, DEFAULT_SOUL)
+        if not os.path.exists(MEMORY_FILE):
+            _atomic_write(MEMORY_FILE, MEMORY_HEADER + "\n")
+
+
+def _read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def memory_snapshot():
+    ensure_memory()
+    with _memory_lock:
+        return _read_text(SOUL_FILE), _read_text(MEMORY_FILE)
+
+
+def memory_save_soul(text):
+    ensure_memory()
+    with _memory_lock:
+        _atomic_write(SOUL_FILE, text)
+
+
+def memory_replace(text):
+    ensure_memory()
+    with _memory_lock:
+        _atomic_write(MEMORY_FILE, text)
+
+
+def memory_append(entry):
+    """追加一条记忆：一事一条、占一行，统一成「- 日期 内容」的样子
+    （条目内部的换行压成空格，保证按行可删；日期取这台电脑的当天）。"""
+    import datetime
+    core = " ".join(str(entry or "").split())
+    if core.startswith("- "):
+        core = core[2:].lstrip()
+    if not core:
+        return False
+    line = "- %s %s" % (datetime.date.today().isoformat(), core)
+    ensure_memory()
+    with _memory_lock:
+        current = _read_text(MEMORY_FILE)
+        if current and not current.endswith("\n"):
+            current += "\n"
+        _atomic_write(MEMORY_FILE, current + line + "\n")
+    return True
 
 
 def print_pair_banner(prefix="配对码（在手机 App 的「电脑」页输入它）："):
@@ -374,6 +482,12 @@ class Handler(BaseHTTPRequestHandler):
             payload.update(collect_status())
             self._send_json(200, payload)
             return
+        if self.path == "/memory":
+            if not self._authed():
+                return self._deny()
+            soul, memory = memory_snapshot()
+            self._send_json(200, {"ok": True, "soul": soul, "memory": memory})
+            return
         self._send_json(404, {"ok": False, "error": "没有这个接口。"})
 
     def do_POST(self):
@@ -406,6 +520,41 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_body()
             code, payload = read_path(str(body.get("path") or ""))
             self._send_json(code, payload)
+            return
+        if self.path == "/memory/soul":
+            body = self._read_body()
+            text = body.get("soul")
+            if not isinstance(text, str):
+                self._send_json(400, {"ok": False, "error": "没给要保存的内容。"})
+                return
+            if len(text) > MAX_MEMORY_CHARS:
+                self._send_json(413, {"ok": False, "error": "内容太长了，超过 %d 字。" % MAX_MEMORY_CHARS})
+                return
+            memory_save_soul(text)
+            self._send_json(200, {"ok": True})
+            return
+        if self.path == "/memory/append":
+            body = self._read_body()
+            text = str(body.get("text") or "")
+            if len(text) > MAX_MEMORY_CHARS:
+                self._send_json(413, {"ok": False, "error": "这一条太长了，超过 %d 字。" % MAX_MEMORY_CHARS})
+                return
+            if not memory_append(text):
+                self._send_json(400, {"ok": False, "error": "这条是空的，没记成。"})
+                return
+            self._send_json(200, {"ok": True})
+            return
+        if self.path == "/memory/replace":
+            body = self._read_body()
+            text = body.get("memory")
+            if not isinstance(text, str):
+                self._send_json(400, {"ok": False, "error": "没给要保存的内容。"})
+                return
+            if len(text) > MAX_MEMORY_CHARS:
+                self._send_json(413, {"ok": False, "error": "内容太长了，超过 %d 字。" % MAX_MEMORY_CHARS})
+                return
+            memory_replace(text)
+            self._send_json(200, {"ok": True})
             return
         self._send_json(404, {"ok": False, "error": "没有这个接口。"})
 
@@ -446,6 +595,7 @@ def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--port":
         port = int(sys.argv[2])
     STATE = State()
+    ensure_memory()
     threading.Thread(target=discovery_loop, args=(port,), daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("Muse CN 电脑底座已启动（版本 %s）" % VERSION, flush=True)
