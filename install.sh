@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Muse CN 电脑底座 · 一键安装（v0.3.0）
+# Muse CN 电脑底座 · 一键安装（v0.4.0）
 # 在 Ubuntu / Debian 电脑上粘贴运行：
 #   curl -fsSL https://raw.githubusercontent.com/zhangweiy77/muse-cn-releases/main/install.sh | bash
 # 做四件事：把底座程序放进 ~/.musecn、设成开机自启的常驻服务、启动它、打印 6 位配对码。
@@ -27,34 +27,44 @@ cat > "$DIR/musecn_pc.py" <<'MUSECN_PC_PY_EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Muse CN 电脑底座（musecn-pc）v0.3.0
+Muse CN 电脑底座（musecn-pc）v0.4.0
 
 纯 Python 标准库、零依赖的小服务，形态学 mac-hand：
-- HTTP JSON 接口（状态 / 执行命令 / 读文件 / 长期记忆），令牌鉴权，无令牌一律拒绝
+- HTTP JSON 接口（状态 / 执行命令 / 读文件 / 长期记忆 / 电脑浏览器），令牌鉴权，无令牌一律拒绝
 - UDP 广播发现：手机在同一局域网里能找到这台电脑
 - 配对：服务启动时生成 6 位配对码（终端大字打印 + 写 ~/.musecn/pairing.txt），
   手机输码换长期令牌，配对只做一次，令牌落盘、重启不丢
 - 长期记忆（v0.3 新增）：~/.musecn/memory/ 下两个文件——SOUL.md 是助手的
   「性格说明书」（用户可改），MEMORY.md 是蒸馏过的长期记忆条目（每行一条）。
   与聊天记录分工：记录是流水、留手机本地；这里存的是提炼后要长期用的。
+- 电脑浏览器（v0.4 新增）：底座自带一个最小 CDP 驱动，驱动系统里的
+  Chrome/Chromium（独立资料夹 ~/.musecn/browser-profile，不动用户自己的
+  浏览器与登录态），给手机上的「脑」开页 / 读正文 / 点按钮 / 填表单 / 滚动。
+  CDP 只绑 127.0.0.1。付款确认、密码框这类步骤不代办，明确回绝让用户本人来。
 
 状态目录：~/.musecn/（state.json 存令牌与配对状态，权限 600）
 监听：0.0.0.0:18790（HTTP），UDP 18791（发现）。可用环境变量 MUSECN_PORT 改 HTTP 端口。
 """
 
+import atexit
+import base64
+import hashlib
+import http.client
 import json
 import os
 import platform
 import secrets
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_PORT = int(os.environ.get("MUSECN_PORT", "18790"))
 DISCOVERY_PORT = 18791
 DISCOVERY_MAGIC = "MUSECN_DISCOVER_V1"
@@ -427,6 +437,459 @@ def read_path(raw_path):
     }
 
 
+# ---------------- 电脑浏览器（v0.4 新增） ----------------
+#
+# 底座自带的最小 CDP 驱动：找系统里的 Chrome/Chromium，用独立资料夹
+# ~/.musecn/browser-profile 启动（不动用户自己的浏览器与登录态），
+# CDP 只绑 127.0.0.1。WebSocket 客户端是纯标准库手写的最小实现。
+# 边界：付款确认按钮不点、密码框不填——明确回 refused，让用户本人来。
+
+BROWSER_PROFILE_DIR = os.path.join(STATE_DIR, "browser-profile")
+BROWSER_LOG = os.path.join(STATE_DIR, "browser.log")
+BROWSER_BIN_NAMES = [
+    "google-chrome", "google-chrome-stable",
+    "chromium", "chromium-browser", "chromium-browser-stable",
+]
+MAX_PAGE_TEXT = 12000  # 读正文截断上限
+
+# 页面正文提取：标题 / 网址 / 正文 / 有没有密码框（手机侧同名标记、同形状）
+_JS_EXTRACT = r"""(() => { /*MUSECN_EXTRACT*/
+  const body = document.body;
+  const text = body ? (body.innerText || '') : '';
+  return {
+    url: location.href,
+    title: document.title || '',
+    text: text.slice(0, 12000),
+    hasPassword: !!document.querySelector('input[type="password"]')
+  };
+})()"""
+
+# 按可见文字点击：完全相等优先，其次开头对上、其次包含；付款确认类按钮回绝
+_JS_CLICK = r"""(() => { /*MUSECN_CLICK*/
+  const target = __MUSECN_TARGET__;
+  const payRe = /确认付款|确认支付|立即付款|立即支付|付款确认|pay now|confirm payment/i;
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el.getClientRects || el.getClientRects().length === 0) return false;
+    const st = window.getComputedStyle(el);
+    return st.visibility !== 'hidden' && st.display !== 'none';
+  };
+  const label = (el) => norm(el.innerText || el.value || el.getAttribute('aria-label') || '');
+  const sels = 'a, button, input[type="submit"], input[type="button"], [role="button"]';
+  const els = Array.from(document.querySelectorAll(sels)).filter(visible);
+  let best = null, bestScore = -1;
+  for (const el of els) {
+    const lab = label(el);
+    if (!lab) continue;
+    let score = -1;
+    if (lab === target) score = 1000 - lab.length;
+    else if (lab.startsWith(target)) score = 500 - lab.length;
+    else if (lab.includes(target)) score = 100 - lab.length;
+    if (score > bestScore) { bestScore = score; best = el; }
+  }
+  if (!best) return { ok: false, refused: null, text: '' };
+  const lab = label(best);
+  if (payRe.test(lab)) return { ok: false, refused: 'pay', text: lab };
+  best.scrollIntoView({ block: 'center' });
+  best.click();
+  return { ok: true, refused: null, text: lab };
+})()"""
+
+# 按字段提示填字：用原生 setter 写值再补 input/change 事件（框架表单才认）；
+# 密码框回绝；给了提示却找不到字段时报 notfound，不乱填第一个
+_JS_FILL = r"""(() => { /*MUSECN_FILL*/
+  const hint = __MUSECN_HINT__;
+  const value = __MUSECN_VALUE__;
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = (el) => {
+    if (!el.getClientRects || el.getClientRects().length === 0) return false;
+    const st = window.getComputedStyle(el);
+    return st.visibility !== 'hidden' && st.display !== 'none';
+  };
+  const labelOf = (el) => {
+    const parts = [el.getAttribute('placeholder'), el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('aria-label')];
+    if (el.labels) { for (const l of el.labels) parts.push(l.innerText); }
+    return norm(parts.filter(Boolean).join(' '));
+  };
+  const badTypes = ['hidden', 'submit', 'button', 'checkbox', 'radio', 'file'];
+  const els = Array.from(document.querySelectorAll('input, textarea')).filter((el) => {
+    const t = (el.getAttribute('type') || 'text').toLowerCase();
+    return visible(el) && badTypes.indexOf(t) < 0;
+  });
+  let best = null;
+  if (hint) {
+    const h = norm(hint);
+    best = els.find((el) => labelOf(el).includes(h)) || null;
+    if (!best) return { ok: false, refused: null, notfound: true, value: '', type: '' };
+  } else if (els.length > 0) {
+    best = els[0];
+  }
+  if (!best) return { ok: false, refused: null, notfound: true, value: '', type: '' };
+  const type = (best.getAttribute('type') || 'text').toLowerCase();
+  if (type === 'password') return { ok: false, refused: 'password', notfound: false, value: '', type: type };
+  const proto = best.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+  setter.call(best, value);
+  best.dispatchEvent(new Event('input', { bubbles: true }));
+  best.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ok: true, refused: null, notfound: false, value: best.value, type: type };
+})()"""
+
+_JS_SCROLL = r"""(() => { /*MUSECN_SCROLL*/
+  const dir = __MUSECN_DIR__;
+  const dy = Math.floor(window.innerHeight * 0.85) * (dir === 'up' ? -1 : 1);
+  window.scrollBy(0, dy);
+  return { y: window.scrollY };
+})()"""
+
+
+class BrowserError(Exception):
+    """浏览器层错误：message 是给人看的大白话。"""
+
+
+def find_browser_binary():
+    for name in BROWSER_BIN_NAMES:
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+class _WsClient:
+    """最小 WebSocket 客户端（RFC 6455）：只做 CDP 需要的文本消息收发。"""
+
+    def __init__(self, url, timeout=15):
+        parsed = urllib.parse.urlparse(url)
+        self.host = parsed.hostname or "127.0.0.1"
+        self.port = parsed.port or 80
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        self.sock.settimeout(timeout)
+        self._buf = b""
+        key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        req = (
+            "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            % (path, self.host, self.port, key)
+        )
+        self.sock.sendall(req.encode("ascii"))
+        head = self._read_until(b"\r\n\r\n").decode("iso-8859-1", errors="replace")
+        if " 101" not in head.split("\r\n", 1)[0]:
+            raise BrowserError("浏览器调试通道没连上。")
+        expect = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        ).decode("ascii")
+        if expect not in head:
+            raise BrowserError("浏览器调试通道握手对不上。")
+
+    def _read_until(self, marker):
+        while marker not in self._buf:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise BrowserError("浏览器调试通道断了。")
+            self._buf += chunk
+        idx = self._buf.index(marker) + len(marker)
+        out, self._buf = self._buf[:idx], self._buf[idx:]
+        return out
+
+    def _read_exact(self, n):
+        while len(self._buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise BrowserError("浏览器调试通道断了。")
+            self._buf += chunk
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def send_text(self, text):
+        data = text.encode("utf-8")
+        mask = secrets.token_bytes(4)
+        header = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 65536:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", n)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", n)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        self.sock.sendall(bytes(header) + mask + masked)
+
+    def _send_pong(self, data):
+        mask = secrets.token_bytes(4)
+        body = data[:125]
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(body))
+        self.sock.sendall(bytes([0x8A, 0x80 | len(masked)]) + mask + masked)
+
+    def recv_text(self):
+        payload = b""
+        while True:
+            h = self._read_exact(2)
+            fin = h[0] & 0x80
+            opcode = h[0] & 0x0F
+            masked = h[1] & 0x80
+            length = h[1] & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else None
+            data = self._read_exact(length) if length else b""
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if opcode == 0x8:
+                raise BrowserError("浏览器把调试通道关了。")
+            if opcode == 0x9:
+                self._send_pong(data)
+                continue
+            if opcode in (0x0, 0x1, 0x2):
+                payload += data
+                if fin:
+                    return payload.decode("utf-8", errors="replace")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class PcBrowser:
+    """底座自带的浏览器：懒启动、单实例、操作串行；动作后回读验证状态。"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.port = None
+        self.ws = None
+        self.msg_id = 0
+
+    # ---- 进程与连接管理 ----
+
+    def _http_json(self, method, path, timeout=5):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        try:
+            conn.request(method, path)
+            resp = conn.getresponse()
+            raw = resp.read()
+            if resp.status >= 400:
+                raise BrowserError("浏览器调试接口回了 %d。" % resp.status)
+            return json.loads(raw.decode("utf-8", errors="replace") or "{}")
+        finally:
+            conn.close()
+
+    def _port_alive(self, port):
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            conn.request("GET", "/json/version")
+            resp = conn.getresponse()
+            resp.read()
+            return resp.status == 200
+        except Exception:
+            return False
+
+    def _read_active_port(self):
+        try:
+            with open(os.path.join(BROWSER_PROFILE_DIR, "DevToolsActivePort"),
+                      "r", encoding="utf-8") as f:
+                return int(f.read().splitlines()[0].strip())
+        except Exception:
+            return None
+
+    def _launch(self, binary):
+        os.makedirs(BROWSER_PROFILE_DIR, exist_ok=True)
+        args = [
+            binary,
+            "--user-data-dir=" + BROWSER_PROFILE_DIR,
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--window-size=1280,900",
+        ]
+        if not os.environ.get("DISPLAY"):
+            args.append("--headless=new")
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            args.append("--no-sandbox")
+        args.append("about:blank")
+        log = open(BROWSER_LOG, "ab")
+        self.proc = subprocess.Popen(args, stdout=log, stderr=log, start_new_session=True)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            port = self._read_active_port()
+            if port and self._port_alive(port):
+                self.port = port
+                return
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.25)
+        raise BrowserError("浏览器启动失败，看日志：~/.musecn/browser.log")
+
+    def _connect(self):
+        targets = self._http_json("GET", "/json/list")
+        page = None
+        if isinstance(targets, list):
+            for t in targets:
+                if isinstance(t, dict) and t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+                    page = t
+                    break
+        if page is None:
+            created = self._http_json("PUT", "/json/new?about:blank")
+            if isinstance(created, dict) and created.get("webSocketDebuggerUrl"):
+                page = created
+        if page is None:
+            raise BrowserError("浏览器里没有可用的页面。")
+        self.ws = _WsClient(page["webSocketDebuggerUrl"])
+        self.msg_id = 0
+
+    def ensure(self):
+        if self.ws is not None and self.port and self._port_alive(self.port):
+            return
+        self._drop_connection()
+        binary = find_browser_binary()
+        if not binary:
+            raise BrowserError("这台电脑上没找到能用的浏览器（Chrome 或 Chromium），先装一个浏览器再试。")
+        port = self._read_active_port()
+        if port and self._port_alive(port):
+            self.port = port  # 复用还活着的旧实例（底座重启过、浏览器没关）
+        else:
+            self._launch(binary)
+        self._connect()
+
+    def _drop_connection(self):
+        if self.ws is not None:
+            self.ws.close()
+            self.ws = None
+
+    def shutdown(self):
+        self._drop_connection()
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        self.proc = None
+
+    # ---- CDP 调用 ----
+
+    def call(self, method, params=None):
+        if self.ws is None:
+            raise BrowserError("浏览器还没连上。")
+        self.msg_id += 1
+        mid = self.msg_id
+        try:
+            self.ws.send_text(json.dumps({"id": mid, "method": method, "params": params or {}}))
+            while True:
+                msg = json.loads(self.ws.recv_text())
+                if msg.get("id") != mid:
+                    continue  # 事件通知，跳过
+                if "error" in msg:
+                    raise BrowserError("浏览器执行这一步时出错了。")
+                return msg.get("result") or {}
+        except BrowserError:
+            raise
+        except Exception:
+            self._drop_connection()
+            raise BrowserError("浏览器没回话，可能已经关了，下一步会自动重开。")
+
+    def evaluate(self, expr):
+        result = self.call("Runtime.evaluate", {
+            "expression": expr,
+            "returnByValue": True,
+            "awaitPromise": True,
+        })
+        if result.get("exceptionDetails"):
+            raise BrowserError("页面里的脚本出错了，这一步没做成。")
+        inner = result.get("result") or {}
+        return inner.get("value")
+
+    def _wait_ready(self, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self.evaluate("document.readyState") in ("complete", "interactive"):
+                    return
+            except BrowserError:
+                pass
+            time.sleep(0.2)
+
+    def extract(self):
+        value = self.evaluate(_JS_EXTRACT)
+        if not isinstance(value, dict):
+            raise BrowserError("没读到页面内容。")
+        return {
+            "url": str(value.get("url") or ""),
+            "title": str(value.get("title") or ""),
+            "text": str(value.get("text") or "")[:MAX_PAGE_TEXT],
+            "has_password": bool(value.get("hasPassword")),
+        }
+
+    # ---- 对外操作（端点调用，自带锁串行） ----
+
+    def open(self, url):
+        with self.lock:
+            self.ensure()
+            self.call("Page.enable")
+            self.call("Page.navigate", {"url": url})
+            self._wait_ready()
+            return self.extract()
+
+    def read(self):
+        with self.lock:
+            self.ensure()
+            return self.extract()
+
+    def click(self, text):
+        with self.lock:
+            self.ensure()
+            expr = _JS_CLICK.replace("__MUSECN_TARGET__", json.dumps(text, ensure_ascii=False))
+            value = self.evaluate(expr)
+            if not isinstance(value, dict):
+                raise BrowserError("点击这一步没做成。")
+            if value.get("ok"):
+                time.sleep(0.5)
+                self._wait_ready(timeout=5)
+            return {
+                "clicked": bool(value.get("ok")),
+                "refused": value.get("refused"),
+                "clicked_text": str(value.get("text") or ""),
+                "page": self.extract(),
+            }
+
+    def fill(self, field, text):
+        with self.lock:
+            self.ensure()
+            expr = (_JS_FILL
+                    .replace("__MUSECN_HINT__", json.dumps(field, ensure_ascii=False))
+                    .replace("__MUSECN_VALUE__", json.dumps(text, ensure_ascii=False)))
+            value = self.evaluate(expr)
+            if not isinstance(value, dict):
+                raise BrowserError("填表这一步没做成。")
+            return {
+                "filled": bool(value.get("ok")),
+                "refused": value.get("refused"),
+                "notfound": bool(value.get("notfound")),
+                "value": str(value.get("value") or ""),
+                "field_type": str(value.get("type") or ""),
+            }
+
+    def scroll(self, direction):
+        with self.lock:
+            self.ensure()
+            self.evaluate(_JS_SCROLL.replace("__MUSECN_DIR__", json.dumps(direction)))
+            time.sleep(0.3)
+            return {"page": self.extract()}
+
+
+BROWSER = PcBrowser()
+
+
 # ---------------- HTTP 接口 ----------------
 
 
@@ -480,6 +943,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._deny()
             payload = {"ok": True}
             payload.update(collect_status())
+            binary = find_browser_binary()
+            payload["browser_available"] = binary is not None
+            payload["browser_binary"] = os.path.basename(binary) if binary else None
             self._send_json(200, payload)
             return
         if self.path == "/memory":
@@ -520,6 +986,63 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_body()
             code, payload = read_path(str(body.get("path") or ""))
             self._send_json(code, payload)
+            return
+        if self.path == "/browser/open":
+            body = self._read_body()
+            url = str(body.get("url") or "").strip()
+            if not url:
+                self._send_json(400, {"ok": False, "error": "没给要打开的网址。"})
+                return
+            if "://" not in url:
+                url = "https://" + url
+            try:
+                payload = {"ok": True}
+                payload.update(BROWSER.open(url))
+            except BrowserError as e:
+                payload = {"ok": False, "error": str(e)}
+            self._send_json(200, payload)
+            return
+        if self.path == "/browser/read":
+            try:
+                payload = {"ok": True}
+                payload.update(BROWSER.read())
+            except BrowserError as e:
+                payload = {"ok": False, "error": str(e)}
+            self._send_json(200, payload)
+            return
+        if self.path == "/browser/click":
+            body = self._read_body()
+            text = str(body.get("text") or "").strip()
+            if not text:
+                self._send_json(400, {"ok": False, "error": "没给要点哪个按钮（写着什么字）。"})
+                return
+            try:
+                payload = {"ok": True}
+                payload.update(BROWSER.click(text))
+            except BrowserError as e:
+                payload = {"ok": False, "error": str(e)}
+            self._send_json(200, payload)
+            return
+        if self.path == "/browser/fill":
+            body = self._read_body()
+            field = str(body.get("field") or "").strip()
+            text = str(body.get("text") or "")
+            try:
+                payload = {"ok": True}
+                payload.update(BROWSER.fill(field, text))
+            except BrowserError as e:
+                payload = {"ok": False, "error": str(e)}
+            self._send_json(200, payload)
+            return
+        if self.path == "/browser/scroll":
+            body = self._read_body()
+            direction = "up" if str(body.get("direction") or "").lower() == "up" else "down"
+            try:
+                payload = {"ok": True}
+                payload.update(BROWSER.scroll(direction))
+            except BrowserError as e:
+                payload = {"ok": False, "error": str(e)}
+            self._send_json(200, payload)
             return
         if self.path == "/memory/soul":
             body = self._read_body()
@@ -596,6 +1119,7 @@ def main():
         port = int(sys.argv[2])
     STATE = State()
     ensure_memory()
+    atexit.register(BROWSER.shutdown)
     threading.Thread(target=discovery_loop, args=(port,), daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("Muse CN 电脑底座已启动（版本 %s）" % VERSION, flush=True)
