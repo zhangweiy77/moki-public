@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Muse CN 电脑底座 · 一键安装（v0.4.0）
+# Moki 电脑底座 · 一键安装（v0.4.0）
 # 在 Ubuntu / Debian 电脑上粘贴运行：
-#   curl -fsSL https://raw.githubusercontent.com/zhangweiy77/muse-cn-releases/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/zhangweiy77/moki-public/main/install.sh | bash
 # 做四件事：把底座程序放进 ~/.musecn、设成开机自启的常驻服务、启动它、打印 6 位配对码。
 # 重复运行 = 升级并重启服务，已配对的令牌不会丢、不用重新配对。
 set -uo pipefail
@@ -27,7 +27,7 @@ cat > "$DIR/musecn_pc.py" <<'MUSECN_PC_PY_EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Muse CN 电脑底座（musecn-pc）v0.4.0
+Moki 电脑底座（musecn-pc）v0.4.0
 
 纯 Python 标准库、零依赖的小服务，形态学 mac-hand：
 - HTTP JSON 接口（状态 / 执行命令 / 读文件 / 长期记忆 / 电脑浏览器），令牌鉴权，无令牌一律拒绝
@@ -185,11 +185,11 @@ STATE = None  # 在 main 里初始化
 
 # ---------------- 长期记忆（SOUL + MEMORY） ----------------
 
-DEFAULT_SOUL = """【先说清这一页】这是住在这台电脑里的助手 Muse CN 的「性格说明书」：它怎么说话、怎么做事，都照这里写的来。你把这里改了，它下次跟你说话就会照新的来。
+DEFAULT_SOUL = """【先说清这一页】这是住在这台电脑里的助手 Moki 的「性格说明书」：它怎么说话、怎么做事，都照这里写的来。你把这里改了，它下次跟你说话就会照新的来。
 
 # 我是谁
 
-我是 Muse CN，住在你这台电脑里的助手。你在手机上给我下令，我在这台电脑上帮你干活，办完把结果带回来给你。
+我是 Moki，住在你这台电脑里的助手。你在手机上给我下令，我在这台电脑上帮你干活，办完把结果带回来给你。
 
 # 我怎么说话
 
@@ -1122,7 +1122,7 @@ def main():
     atexit.register(BROWSER.shutdown)
     threading.Thread(target=discovery_loop, args=(port,), daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print("Muse CN 电脑底座已启动（版本 %s）" % VERSION, flush=True)
+    print("Moki 电脑底座已启动（版本 %s）" % VERSION, flush=True)
     print("电脑名：%s，系统：%s" % (socket.gethostname(), os_pretty_name()), flush=True)
     ips = lan_ips()
     if ips:
@@ -1144,7 +1144,7 @@ chmod 600 "$DIR/musecn_pc.py"
 
 cat > "$DIR/start.sh" <<EOF2
 #!/bin/sh
-# Muse CN 电脑底座启动脚本（安装器生成）
+# Moki 电脑底座启动脚本（安装器生成）
 exec /usr/bin/env python3 "$DIR/musecn_pc.py"
 EOF2
 chmod +x "$DIR/start.sh"
@@ -1167,7 +1167,7 @@ if [ "$USE_SYSTEMD" = "1" ]; then
     mkdir -p "$UNIT_DIR"
     cat > "$UNIT_DIR/musecn.service" <<EOF3
 [Unit]
-Description=Muse CN PC base (musecn-pc)
+Description=Moki PC base (musecn-pc)
 After=network.target
 
 [Service]
@@ -1213,11 +1213,11 @@ done
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 say ""
 say "=================================================="
-say "Muse CN 电脑底座装好了，正在运行。"
+say "Moki 电脑底座装好了，正在运行。"
 [ -n "$IP" ] && say "这台电脑的局域网地址：$IP"
 if [ -f "$DIR/pairing.txt" ]; then
     say ""
-    say "下一步：打开手机上的 Muse CN App →「电脑」页 → 点「查找家里的电脑」，"
+    say "下一步：打开手机上的 Moki App →「电脑」页 → 点「查找家里的电脑」，"
     say "然后把下面这个 6 位配对码输进去（只输这一次，以后自动连）："
     say ""
     python3 - "$DIR/pairing.txt" <<'PYEOF'
